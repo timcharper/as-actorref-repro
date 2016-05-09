@@ -1,114 +1,90 @@
 package m
 
-import akka.stream.scaladsl._
-import akka.stream._
+import java.time.temporal.ChronoUnit
+
+import scala.concurrent.Await
+import scala.concurrent.duration._
+
 import akka.actor._
-import akka.stream.stage._
-import scala.collection.mutable
-
-trait IngestionMethods[A] {
-  def submit(value: A): Unit
-  def complete(): Unit
-}
-
-
-class Ingestor[A] extends GraphStageWithMaterializedValue[SourceShape[A], IngestionMethods[A]] {
-
-  val out = Outlet[A]("Ingestor.out")
-  val shape = SourceShape.of(out)
-
-  override def createLogicAndMaterializedValue(inheritedAttributes: Attributes): (GraphStageLogic, IngestionMethods[A]) = {
-
-    class IngestorLogic(shape: Shape) extends GraphStageLogic(shape) with IngestionMethods[A] {
-      /* We only have one thread dequeuing items, so it's safe to say that if the
-       * queue is not empty, then there will be an item available to pull.
-       */
-      private val buffer = new java.util.concurrent.ConcurrentLinkedQueue[A]
-      private var downstreamWaiting = false
-      private var downstreamFinished = false
-      private var completing = false
-
-      private val scheduled = new java.util.concurrent.atomic.AtomicBoolean(false)
-      private val processScheduled = getAsyncCallback[Unit] { (_) =>
-        if (!scheduled.compareAndSet(true, false)) {
-          throw new Exception("Code should never reach here. Error. Critical pain. No no no. Requesting repairs.")
-        }
-
-        if ((downstreamWaiting) && (! buffer.isEmpty)) {
-          downstreamWaiting = false
-          push(out, buffer.poll())
-        }
-
-      }
-      def submit(value: A): Unit = {
-        if (completing) return ()
-        buffer.offer(value)
-
-        /* if scheduled is still true after we've offered our value, then it is
-        guaranteed to be processed, because processing always occurs AFTER
-        transition from true to false */
-        if (scheduled.compareAndSet(false, true)) {
-          processScheduled.invoke(())
-        }
-      }
-
-      def complete(): Unit = {
-        completing = true
-        getAsyncCallback[Unit] { (_) =>
-          emitMultiple(out, buffer.iterator)
-          completeStage()
-        }.invoke(())
-      }
-
-      setHandler(out, new OutHandler {
-        override def onPull(): Unit = {
-          if (buffer.isEmpty) {
-            downstreamWaiting = true
-          } else {
-            push(out, buffer.poll())
-          }
-        }
-      })
-    }
-
-    val logic = new IngestorLogic(shape)
-
-    (logic, logic: IngestionMethods[A])
-  }
-}
+import akka.stream._
+import akka.stream.scaladsl._
 
 object Repro extends App {
+
+  def benchmark(body: => Unit): Long = {
+    val a = java.time.ZonedDateTime.now()
+    body
+    val b = java.time.ZonedDateTime.now()
+    a.until(b, ChronoUnit.MILLIS)
+  }
+
   implicit val system = ActorSystem("test")
   implicit val materializer = ActorMaterializer()
   implicit val ec = system.dispatcher
 
-  val (input, completed) = Source.fromGraph(new Ingestor[Int]).
-    toMat(Sink.foreach { n =>
-      Thread.sleep(1)
-      println(s"Processed ${n}")
-    })(Keep.both).
-    run
+  val samples = (1 to 15).map { _ =>
 
-  (1 to 10).foreach { n =>
-    Thread.sleep(10)
-    input.submit(n)
-    println(s"Sent ${n}")
-  }
-  (11 to 50).foreach { n =>
-    input.submit(n)
-    println(s"Sent ${n}")
-  }
+    val iters = 1000000
 
-  input.complete()
-  println(s"Sent complete")
+    val actorBenchmark = benchmark {
+      val (input, completed) = Source.actorRef[Int](Int.MaxValue, OverflowStrategy.fail).
+        toMat(Sink.ignore)(Keep.both).
+        run
+      var i = 0
+      while (i < iters) {
+        input ! iters
+        i+=1
+      }
+      input ! Status.Success(Unit)
 
-  (51 to 100).foreach { n =>
-    input.submit(n)
-    println(s"Sent ${n}")
-  }
+      Await.result(completed, 2.minutes)
+    }
 
-  completed.onComplete { result =>
-    println(s"all done! Result = ${result}")
-    system.terminate()
+    val queueBenchmark = benchmark {
+      val (input, completed) = Source.queue(Int.MaxValue, OverflowStrategy.fail).
+        toMat(Sink.ignore)(Keep.both).
+        run
+      var i = 0
+      while (i < iters) {
+        input.offer(i)
+        i+=1
+      }
+      input.complete()
+
+      Await.result(completed, 2.minutes)
+    }
+
+    val ingestorBenchmark = benchmark {
+      val (input, completed) = Source.fromGraph(new Ingestor[Int]).
+        toMat(Sink.ignore)(Keep.both).
+        run
+      var i = 0
+      while (i < iters) {
+        input.submit(i)
+        i+=1
+      }
+      input.complete()
+
+      Await.result(completed, 2.minutes)
+    }
+
+    val results = Map(
+      'actor -> actorBenchmark,
+      'queue -> queueBenchmark,
+      'ingestor -> ingestorBenchmark)
+
+    results.foreach { case (k, v) =>
+      println(s"${k}: ${v}ms")
+    }
+    println(s"========================================")
+
+    results
+  }.toList.tail
+
+  samples.reduce { (a, b) =>
+    a.transform { (k, v) => v + b.getOrElse(k, 0L) }
+  }.foreach { case (k, sum) =>
+      println(s"${k} - Total: ${sum} Avg: ${sum / samples.length}")
   }
+  system.terminate()
 }
