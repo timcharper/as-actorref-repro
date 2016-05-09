@@ -13,21 +13,21 @@ trait IngestionMethods[A] {
 
 
 class Ingestor[A] extends GraphStageWithMaterializedValue[SourceShape[A], IngestionMethods[A]] {
-  /* We only have one thread dequeuing items, so it's safe to say that if the
-   * queue is not empty, then there will be an item available to pull.
-   */
-  private val buffer = new java.util.concurrent.ConcurrentLinkedQueue[A]
 
   val out = Outlet[A]("Ingestor.out")
   val shape = SourceShape.of(out)
 
-  private var downstreamWaiting = false
-  private var downstreamFinished = false
-  private var completing = false
-
   override def createLogicAndMaterializedValue(inheritedAttributes: Attributes): (GraphStageLogic, IngestionMethods[A]) = {
 
     class IngestorLogic(shape: Shape) extends GraphStageLogic(shape) with IngestionMethods[A] {
+      /* We only have one thread dequeuing items, so it's safe to say that if the
+       * queue is not empty, then there will be an item available to pull.
+       */
+      private val buffer = new java.util.concurrent.ConcurrentLinkedQueue[A]
+      private var downstreamWaiting = false
+      private var downstreamFinished = false
+      private var completing = false
+
       private val scheduled = new java.util.concurrent.atomic.AtomicBoolean(false)
       private val processScheduled = getAsyncCallback[Unit] { (_) =>
         if (!scheduled.compareAndSet(true, false)) {

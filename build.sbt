@@ -10,3 +10,5 @@ libraryDependencies ++= Seq(
   "com.typesafe.akka" %% "akka-actor" % akkaVersion,
   "com.typesafe.akka" %% "akka-stream" % akkaVersion
 )
+
+scalacOptions += "-feature"
